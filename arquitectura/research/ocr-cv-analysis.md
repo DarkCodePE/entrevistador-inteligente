@@ -5,19 +5,19 @@
 | Fecha | 2026-01-31 |
 | Autor | Research Agent |
 | Relacionado con | ADR-007 (CV Pipeline), ADR-004 (AI/ML Infrastructure) |
-| Basado en | Investigacion OCR para recibos de luz |
+| Basado en | Investigacion OCR para recibos |
 
 ---
 
 ## 1. Resumen Ejecutivo
 
-Este documento analiza como aplicar la investigacion de OCR realizada para recibos de luz al contexto de parsing de CVs para "Entrevistador Inteligente". Se evaluan las herramientas identificadas, se comparan costos entre soluciones cloud y open source, y se propone una arquitectura hibrida optimizada para CVs.
+Este documento analiza como aplicar la investigacion de OCR realizada para recibos al contexto de parsing de CVs para "Entrevistador Inteligente". Se evaluan las herramientas identificadas, se comparan costos entre soluciones cloud y open source, y se propone una arquitectura hibrida optimizada para CVs.
 
 ### Conclusion Principal
 
 **La estrategia hibrida de 3 niveles es aplicable a CVs con modificaciones:**
 
-| Nivel | Recibos de Luz | CVs (Adaptado) |
+| Nivel | Recibos | CVs (Adaptado) |
 |-------|----------------|----------------|
 | 1 | Coordenadas fijas | Deteccion de secciones por patrones de texto |
 | 2 | PP-DocLayout | PP-DocLayout + LayoutParser (tablas, columnas) |
@@ -31,7 +31,7 @@ Este documento analiza como aplicar la investigacion de OCR realizada para recib
 
 ### 2.1 Caracteristicas Estructurales
 
-| Aspecto | Recibos de Luz | CVs |
+| Aspecto | Recibos | CVs |
 |---------|----------------|-----|
 | **Estructura** | Fija, predecible | Variable, creativa |
 | **Layout** | Tabular, formulario | Multi-columna, secciones libres |
@@ -45,30 +45,30 @@ Este documento analiza como aplicar la investigacion de OCR realizada para recib
 ### 2.2 Complejidades Adicionales de CVs
 
 ```
-RECIBO DE LUZ                         CV / CURRICULUM
-+---------------------------+         +---------------------------+
-| NOMBRE: [campo fijo]      |         | JUAN PEREZ GARCIA         |
-| DIRECCION: [campo fijo]   |         | Software Engineer         |
-| CONSUMO: [tabla]          |         | juan@email.com | LinkedIn |
-|   - kWh: 150              |         +---------------------------+
-|   - Precio: 0.50          |         | EXPERIENCIA               |
-|   - Total: 75.00          |         | +-------------------------+
-| FECHA: [campo fijo]       |         | | Tech Company  2022-2024 |
-+---------------------------+         | | - Backend Developer     |
-                                      | | - Python, Django, AWS   |
-Estructura PREDECIBLE                 | | > Logro 1: +30% perf    |
-Campos en posiciones conocidas        | | > Logro 2: Lidere 5     |
-                                      | +-------------------------+
-                                      | | Otra Empresa  2020-2022 |
-                                      | | - Junior Dev            |
-                                      | +-------------------------+
-                                      | EDUCACION                 |
-                                      | ...                       |
-                                      +---------------------------+
+CV / CURRICULUM
++---------------------------+
+| JUAN PEREZ GARCIA         |
+| Software Engineer         |
+| juan@email.com | LinkedIn |
++---------------------------+
+| EXPERIENCIA               |
+| +-------------------------+
+| | Tech Company  2022-2024 |
+| | - Backend Developer     |
+| | - Python, Django, AWS   |
+| | > Logro 1: +30% perf    |
+| | > Logro 2: Lidere 5     |
+| +-------------------------+
+| | Otra Empresa  2020-2022 |
+| | - Junior Dev            |
+| +-------------------------+
+| EDUCACION                 |
+| ...                       |
++---------------------------+
 
-                                      Estructura VARIABLE
-                                      Secciones en cualquier orden
-                                      Formatos creativos (2 columnas, etc)
+Estructura VARIABLE
+Secciones en cualquier orden
+Formatos creativos (2 columnas, etc)
 ```
 
 ### 2.3 Implicaciones para OCR
@@ -673,7 +673,7 @@ monitoring:
 
 ## 11. Conclusion
 
-La investigacion de OCR para recibos de luz proporciona una base solida para el CV parsing, pero requiere adaptaciones significativas:
+La investigacion de OCR para recibos proporciona una base solida para el CV parsing, pero requiere adaptaciones significativas:
 
 ### Adaptaciones Clave:
 

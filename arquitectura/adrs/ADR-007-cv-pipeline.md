@@ -2,11 +2,12 @@
 
 | Metadata | Value |
 |----------|-------|
-| Estado | Propuesto |
+| Estado | Actualizado |
 | Fecha | 2026-01-31 |
 | Autores | Equipo de Arquitectura |
 | Revisores | - |
 | Relacionado con | ADR-005 (Almacenamiento), ADR-006 (AI/ML) |
+| Revision | 2.0 - Pipeline OCR Hibrido |
 
 ## Contexto
 
@@ -20,26 +21,54 @@
 - Scoring de compatibilidad con sistemas ATS
 - Sugerencias de optimizacion para el candidato
 
-### Flujo del Pipeline
+### Flujo del Pipeline (Actualizado v2.0)
 
 ```
-+------------------+     +---------------+     +------------------+
-|    Upload        |     |    OCR        |     |    Parsing       |
-| PDF/Word/Image   | --> | (si imagen)   | --> | Extraer secciones|
-+------------------+     +---------------+     +------------------+
-                                                       |
-                                                       v
-+------------------+     +---------------+     +------------------+
-|   Sugerencias    |     |   ATS Score   |     |    Embedding     |
-|   de Mejora      | <-- |   Calculo     | <-- |  Vectorizacion   |
-+------------------+     +---------------+     +------------------+
-                                ^
-                                |
-                         +---------------+
-                         |     NLP       |
-                         | Entidades +   |
-                         | Skills        |
-                         +---------------+
+Upload CV (PDF/DOCX/Image)
+       |
+       v
++--------------------------------------+
+| NIVEL 1: Procesamiento Open Source   |
+| -------------------------------------|
+| 1. pdf2image / python-docx           |
+| 2. PaddleOCR (texto espanol)         |
+| 3. PP-DocLayout (secciones)          |
+| 4. spaCy (NER: nombres, fechas)      |
+|                                      |
+| Costo: $0 | Latencia: <3s            |
++--------------------------------------+
+       |
+       v (si confianza < 85%)
++--------------------------------------+
+| NIVEL 2: Cloud Vision Fallback       |
+| -------------------------------------|
+| Google Cloud Vision API              |
+|                                      |
+| Costo: $0.0015/img | Latencia: <2s   |
++--------------------------------------+
+       |
+       v (si aun falla)
++--------------------------------------+
+| NIVEL 3: LLM Vision Fallback         |
+| -------------------------------------|
+| GPT-4 Vision / Gemini 1.5 Pro        |
+| Prompt: "Extract structured CV data" |
+|                                      |
+| Costo: $0.01/img | Latencia: <5s     |
++--------------------------------------+
+       |
+       v
++--------------------------------------+
+| Post-Procesamiento                   |
+| -------------------------------------|
+| - Normalizacion de skills            |
+| - Generacion de embeddings           |
+| - Calculo de ATS Score               |
+| - Sugerencias de mejora              |
++--------------------------------------+
+       |
+       v
+Datos Estructurados --> Embeddings --> PostgreSQL + pgvector
 ```
 
 ### Requisitos de Performance
@@ -53,7 +82,7 @@
 
 ## Decisiones
 
-### Decision 1: Parser de CV
+### Decision 1: Parser de CV (Actualizado v2.0)
 
 **Opciones evaluadas:**
 
@@ -63,27 +92,37 @@
 | **AWS Textract** | Integracion AWS, buena para formularios | Requiere post-procesamiento, menos especializado en CVs | Medio |
 | **resume-parser (OSS)** | Gratuito, control total, personalizable | Menor precision inicial, requiere mantenimiento | Bajo |
 | **Hybrid (OSS + LLM)** | Flexibilidad, precision mejorable, control total | Complejidad de implementacion | Medio |
+| **Hybrid 3-Tier (PaddleOCR + Cloud + LLM)** | Optimo costo/precision, espanol nativo, escalable | Complejidad de implementacion | Bajo-Medio |
 
-**Decision: Hybrid (resume-parser + LLM fallback)**
+**Decision: Hybrid 3-Tier (PaddleOCR + Google Cloud Vision + LLM Vision)**
 
 **Justificacion:**
-- Control total sobre el pipeline sin dependencias de terceros
-- Costo predecible (solo llamadas a LLM cuando sea necesario)
-- Posibilidad de mejorar iterativamente el modelo
-- El LLM (Claude/GPT) actua como fallback para casos complejos
+- **Nivel 1 gratuito**: PaddleOCR + PP-DocLayout eliminan costos de OCR en 85%+ de casos
+- **Soporte nativo espanol**: PaddleOCR tiene modelos optimizados para espanol latinoamericano
+- **Layout intelligence**: PP-DocLayout detecta secciones automaticamente (experiencia, educacion, skills)
+- **Fallback progresivo**: Solo escala a servicios pagos cuando es necesario
+- **Control total**: Sin vendor lock-in en la capa primaria
 
-**Arquitectura del parser:**
+**Arquitectura del parser hibrido:**
 
 ```
                     +------------------+
                     |  Documento Raw   |
+                    | (PDF/DOCX/Image) |
                     +--------+---------+
                              |
                              v
                     +------------------+
-                    | resume-parser    |
-                    | (extraccion      |
-                    |  inicial)        |
+                    | Conversion       |
+                    | pdf2image /      |
+                    | python-docx      |
+                    +--------+---------+
+                             |
+                             v
+                    +------------------+
+                    | NIVEL 1:         |
+                    | PaddleOCR +      |
+                    | PP-DocLayout     |
                     +--------+---------+
                              |
               +--------------+--------------+
@@ -96,53 +135,404 @@
              |                             |
              v                             v
      +----------------+            +----------------+
-     | Usar resultado |            | LLM Fallback   |
-     | directo        |            | (Claude/GPT)   |
-     +----------------+            +----------------+
+     | Usar resultado |            | NIVEL 2:       |
+     | directo        |            | Google Cloud   |
+     | Costo: $0      |            | Vision API     |
+     +----------------+            +-------+--------+
+                                           |
+                            +--------------+--------------+
+                            |                             |
+                            v                             v
+                   +----------------+            +----------------+
+                   | Confidence     |            | Confidence     |
+                   | >= 85%         |            | < 85%          |
+                   +-------+--------+            +-------+--------+
+                           |                             |
+                           v                             v
+                   +----------------+            +----------------+
+                   | Usar resultado |            | NIVEL 3:       |
+                   | Costo: $0.0015 |            | LLM Vision     |
+                   +----------------+            | (GPT-4V/Gemini)|
+                                                | Costo: $0.01   |
+                                                +----------------+
 ```
+
+**Tabla de Costos por Nivel:**
+
+| Nivel | Tecnologia | Costo/Imagen | Latencia | Precision Esperada |
+|-------|------------|--------------|----------|-------------------|
+| 1 | PaddleOCR + PP-DocLayout | $0 | <3s | 85-95% |
+| 2 | Google Cloud Vision | $0.0015 | <2s | 95-98% |
+| 3 | GPT-4 Vision / Gemini 1.5 Pro | $0.01 | <5s | 98-99% |
+
+**Estimacion de distribucion de procesamiento:**
+
+| Nivel | % de CVs procesados | Costo promedio |
+|-------|---------------------|----------------|
+| Nivel 1 (Open Source) | 70-80% | $0 |
+| Nivel 2 (Cloud Vision) | 15-25% | $0.0015 |
+| Nivel 3 (LLM Vision) | 2-5% | $0.01 |
+| **Promedio ponderado** | - | **~$0.0006/CV** |
 
 ---
 
-### Decision 2: Motor de OCR
+### Decision 2: Motor de OCR (Actualizado v2.0)
 
 **Opciones evaluadas:**
 
-| Opcion | Pros | Contras | Costo |
-|--------|------|---------|-------|
-| **Tesseract** | Open source, sin costo, amplio soporte | Precision variable, requiere pre-procesamiento | Gratuito |
-| **Google Vision** | Alta precision (99%+), handwriting support | Costo por imagen, latencia de red | $1.50/1000 imgs |
-| **Azure OCR** | Buena precision, integracion Azure | Costo similar a Google, menos features | $1.00/1000 imgs |
-| **Tesseract + Pre-processing** | Gratuito con precision mejorada | Complejidad adicional | Gratuito |
+| Opcion | Pros | Contras | Costo | Precision Espanol |
+|--------|------|---------|-------|-------------------|
+| **Tesseract** | Open source, amplio soporte | Precision variable, pre-procesamiento necesario | Gratuito | Media (75-85%) |
+| **Google Vision** | Alta precision (99%+), handwriting support | Costo por imagen, latencia de red | $1.50/1000 imgs | Alta (95%+) |
+| **Azure OCR** | Buena precision, integracion Azure | Costo similar a Google, menos features | $1.00/1000 imgs | Alta (93%+) |
+| **PaddleOCR** | Open source, modelos espanol optimizados, deteccion de layout | Requiere mas memoria, GPU opcional | Gratuito | Alta (90-95%) |
+| **PP-DocLayout** | Deteccion de secciones de documentos | Solo layout, no OCR | Gratuito | N/A |
 
-**Decision: Tesseract con pipeline de pre-procesamiento**
+**Decision: PaddleOCR + PP-DocLayout (Nivel 1) con fallbacks progresivos**
 
 **Justificacion:**
-- Costo cero para OCR (importante en fase inicial)
-- Pipeline de pre-procesamiento mejora la precision significativamente
-- Fallback a Google Vision para documentos problematicos
-- Control total sobre el procesamiento
+- **PaddleOCR supera a Tesseract** en precision para espanol latinoamericano
+- **PP-DocLayout** permite segmentacion inteligente de secciones del CV
+- **Costo cero** en la capa primaria (70-80% de documentos)
+- **Deteccion de angulos** automatica sin pre-procesamiento manual
+- **GPU opcional**: funciona en CPU con rendimiento aceptable
 
-**Pipeline de pre-procesamiento:**
+**Implementacion del Parser Hibrido:**
 
 ```python
-# Pseudocodigo del pipeline de pre-procesamiento
+from paddleocr import PaddleOCR
+from paddlex import create_model
+import cv2
+import numpy as np
+from pdf2image import convert_from_path
+from google.cloud import vision
+import openai
+from dataclasses import dataclass
+from typing import Optional, Tuple, Literal
+from enum import Enum
+
+class OCRLevel(Enum):
+    OPENSOURCE = "opensource"
+    CLOUD_VISION = "cloud_vision"
+    LLM_VISION = "llm_vision"
+
+@dataclass
+class OCRResult:
+    text: str
+    confidence: float
+    sections: dict
+    level_used: OCRLevel
+    processing_time_ms: float
+
+class HybridCVParser:
+    """
+    Parser de CV hibrido con 3 niveles de fallback.
+    Optimiza costo y precision automaticamente.
+    """
+
+    def __init__(self, confidence_threshold: float = 0.85):
+        # Nivel 1: Open Source
+        self.ocr = PaddleOCR(
+            lang='es',              # Espanol
+            use_angle_cls=True,     # Detectar rotacion
+            use_gpu=False,          # CPU por defecto
+            show_log=False
+        )
+        self.layout_model = create_model('PP-DocLayout_plus-L')
+
+        # Configuracion
+        self.confidence_threshold = confidence_threshold
+
+        # Nivel 2: Google Cloud Vision (lazy init)
+        self._vision_client = None
+
+    @property
+    def vision_client(self):
+        if self._vision_client is None:
+            self._vision_client = vision.ImageAnnotatorClient()
+        return self._vision_client
+
+    def parse(self, file_path: str) -> Tuple[OCRResult, dict]:
+        """
+        Procesa un CV con fallback automatico entre niveles.
+
+        Args:
+            file_path: Ruta al archivo (PDF, DOCX, o imagen)
+
+        Returns:
+            Tuple[OCRResult, dict]: Resultado OCR y datos estructurados
+        """
+        import time
+        start_time = time.time()
+
+        # Convertir a imagen si es necesario
+        images = self._convert_to_images(file_path)
+
+        # Nivel 1: Open Source (PaddleOCR + PP-DocLayout)
+        result = self._parse_opensource(images)
+        if result.confidence >= self.confidence_threshold:
+            result.processing_time_ms = (time.time() - start_time) * 1000
+            return result, self._extract_structured_data(result)
+
+        # Nivel 2: Google Cloud Vision
+        result = self._parse_cloud_vision(images)
+        if result.confidence >= self.confidence_threshold:
+            result.processing_time_ms = (time.time() - start_time) * 1000
+            return result, self._extract_structured_data(result)
+
+        # Nivel 3: LLM Vision (GPT-4V / Gemini)
+        result = self._parse_llm_vision(images)
+        result.processing_time_ms = (time.time() - start_time) * 1000
+        return result, self._extract_structured_data(result)
+
+    def _convert_to_images(self, file_path: str) -> list:
+        """Convierte PDF/DOCX a lista de imagenes."""
+        if file_path.lower().endswith('.pdf'):
+            return convert_from_path(file_path, dpi=300)
+        elif file_path.lower().endswith(('.docx', '.doc')):
+            # Usar libreoffice para convertir a PDF primero
+            import subprocess
+            subprocess.run([
+                'libreoffice', '--headless', '--convert-to', 'pdf',
+                '--outdir', '/tmp', file_path
+            ])
+            pdf_path = file_path.rsplit('.', 1)[0] + '.pdf'
+            return convert_from_path(f'/tmp/{pdf_path.split("/")[-1]}', dpi=300)
+        else:
+            # Ya es imagen
+            return [cv2.imread(file_path)]
+
+    def _parse_opensource(self, images: list) -> OCRResult:
+        """Nivel 1: PaddleOCR + PP-DocLayout."""
+        all_text = []
+        all_confidences = []
+        sections = {}
+
+        for img in images:
+            # Convertir PIL a numpy si es necesario
+            if hasattr(img, 'convert'):
+                img_array = np.array(img)
+            else:
+                img_array = img
+
+            # OCR con PaddleOCR
+            ocr_result = self.ocr.ocr(img_array, cls=True)
+
+            if ocr_result and ocr_result[0]:
+                for line in ocr_result[0]:
+                    text = line[1][0]
+                    confidence = line[1][1]
+                    all_text.append(text)
+                    all_confidences.append(confidence)
+
+            # Deteccion de layout con PP-DocLayout
+            layout_result = self.layout_model.predict(img_array)
+            for item in layout_result.get('boxes', []):
+                section_type = item.get('label', 'unknown')
+                if section_type not in sections:
+                    sections[section_type] = []
+                sections[section_type].append(item)
+
+        avg_confidence = np.mean(all_confidences) if all_confidences else 0.0
+
+        return OCRResult(
+            text='\n'.join(all_text),
+            confidence=avg_confidence,
+            sections=sections,
+            level_used=OCRLevel.OPENSOURCE,
+            processing_time_ms=0  # Se actualiza despues
+        )
+
+    def _parse_cloud_vision(self, images: list) -> OCRResult:
+        """Nivel 2: Google Cloud Vision API."""
+        from google.cloud.vision_v1 import types
+
+        all_text = []
+        all_confidences = []
+
+        for img in images:
+            # Convertir a bytes
+            if hasattr(img, 'tobytes'):
+                import io
+                buffer = io.BytesIO()
+                img.save(buffer, format='PNG')
+                content = buffer.getvalue()
+            else:
+                _, encoded = cv2.imencode('.png', img)
+                content = encoded.tobytes()
+
+            image = types.Image(content=content)
+            response = self.vision_client.document_text_detection(image=image)
+
+            if response.full_text_annotation:
+                all_text.append(response.full_text_annotation.text)
+                # Calcular confianza promedio
+                for page in response.full_text_annotation.pages:
+                    for block in page.blocks:
+                        all_confidences.append(block.confidence)
+
+        avg_confidence = np.mean(all_confidences) if all_confidences else 0.0
+
+        return OCRResult(
+            text='\n'.join(all_text),
+            confidence=avg_confidence,
+            sections={},  # Cloud Vision no detecta secciones
+            level_used=OCRLevel.CLOUD_VISION,
+            processing_time_ms=0
+        )
+
+    def _parse_llm_vision(self, images: list) -> OCRResult:
+        """Nivel 3: LLM Vision (GPT-4V o Gemini 1.5 Pro)."""
+        import base64
+        import io
+
+        # Convertir primera imagen a base64
+        img = images[0]
+        if hasattr(img, 'tobytes'):
+            buffer = io.BytesIO()
+            img.save(buffer, format='PNG')
+            img_base64 = base64.b64encode(buffer.getvalue()).decode()
+        else:
+            _, encoded = cv2.imencode('.png', img)
+            img_base64 = base64.b64encode(encoded).decode()
+
+        # Prompt optimizado para extraccion de CV
+        prompt = """Analiza esta imagen de CV y extrae toda la informacion estructurada.
+
+        Responde en formato JSON con las siguientes secciones:
+        {
+            "nombre_completo": "",
+            "email": "",
+            "telefono": "",
+            "ubicacion": "",
+            "resumen_profesional": "",
+            "experiencia": [
+                {
+                    "empresa": "",
+                    "cargo": "",
+                    "fecha_inicio": "",
+                    "fecha_fin": "",
+                    "descripcion": ""
+                }
+            ],
+            "educacion": [
+                {
+                    "institucion": "",
+                    "titulo": "",
+                    "fecha": ""
+                }
+            ],
+            "habilidades": [],
+            "idiomas": [],
+            "certificaciones": []
+        }
+
+        Extrae TODA la informacion visible. Si algo no esta claro, indica [ilegible]."""
+
+        response = openai.chat.completions.create(
+            model="gpt-4-vision-preview",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{img_base64}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=4096
+        )
+
+        return OCRResult(
+            text=response.choices[0].message.content,
+            confidence=0.95,  # LLM siempre alta confianza
+            sections={},
+            level_used=OCRLevel.LLM_VISION,
+            processing_time_ms=0
+        )
+
+    def _extract_structured_data(self, result: OCRResult) -> dict:
+        """Extrae datos estructurados del texto OCR usando spaCy."""
+        import spacy
+
+        nlp = spacy.load('es_core_news_lg')
+        doc = nlp(result.text)
+
+        structured = {
+            'nombres': [],
+            'emails': [],
+            'telefonos': [],
+            'fechas': [],
+            'organizaciones': [],
+            'ubicaciones': []
+        }
+
+        for ent in doc.ents:
+            if ent.label_ == 'PER':
+                structured['nombres'].append(ent.text)
+            elif ent.label_ == 'ORG':
+                structured['organizaciones'].append(ent.text)
+            elif ent.label_ == 'LOC':
+                structured['ubicaciones'].append(ent.text)
+            elif ent.label_ == 'DATE':
+                structured['fechas'].append(ent.text)
+
+        # Extraer emails y telefonos con regex
+        import re
+        emails = re.findall(r'[\w\.-]+@[\w\.-]+\.\w+', result.text)
+        phones = re.findall(r'[\+]?[\d\s\-\(\)]{10,}', result.text)
+
+        structured['emails'] = emails
+        structured['telefonos'] = [p.strip() for p in phones]
+
+        return structured
+```
+
+**Pipeline de pre-procesamiento (opcional para Nivel 1):**
+
+```python
 def preprocess_for_ocr(image):
-    # 1. Deskew - corregir inclinacion
-    image = deskew(image)
+    """Pre-procesamiento opcional para imagenes de baja calidad."""
+    import cv2
 
-    # 2. Binarizacion adaptativa
-    image = adaptive_threshold(image)
+    # 1. Convertir a escala de grises
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image
 
-    # 3. Eliminacion de ruido
-    image = denoise(image)
+    # 2. Deskew - corregir inclinacion
+    coords = np.column_stack(np.where(gray > 0))
+    angle = cv2.minAreaRect(coords)[-1]
+    if angle < -45:
+        angle = 90 + angle
+    (h, w) = gray.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    gray = cv2.warpAffine(gray, M, (w, h),
+                          flags=cv2.INTER_CUBIC,
+                          borderMode=cv2.BORDER_REPLICATE)
 
-    # 4. Mejora de contraste
-    image = enhance_contrast(image)
+    # 3. Binarizacion adaptativa
+    binary = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 11, 2
+    )
 
-    # 5. Escalado optimo (300 DPI)
-    image = resize_to_optimal_dpi(image)
+    # 4. Eliminacion de ruido
+    denoised = cv2.fastNlMeansDenoising(binary, None, 10, 7, 21)
 
-    return image
+    # 5. Mejora de contraste (CLAHE)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+
+    return enhanced
 ```
 
 ---
@@ -558,54 +948,150 @@ alerts:
 
 ---
 
+## Metricas de Fallback
+
+### Dashboard de Monitoreo OCR
+
+```yaml
+ocr_metrics:
+  # Distribucion por nivel
+  - ocr_level_usage:
+      type: counter
+      labels: [level]  # opensource, cloud_vision, llm_vision
+      description: "Numero de CVs procesados por nivel"
+
+  # Confidence scores
+  - ocr_confidence_distribution:
+      type: histogram
+      buckets: [0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95, 1.0]
+      labels: [level]
+
+  # Fallback rate
+  - ocr_fallback_rate:
+      type: gauge
+      description: "Porcentaje de CVs que requieren fallback"
+
+  # Costo acumulado
+  - ocr_cost_total:
+      type: counter
+      labels: [level]
+      description: "Costo acumulado en USD por nivel"
+
+  # Latencia por nivel
+  - ocr_latency_seconds:
+      type: histogram
+      buckets: [0.5, 1, 2, 3, 5, 10]
+      labels: [level]
+
+alerts:
+  - name: HighFallbackRate
+    condition: ocr_fallback_rate > 0.30
+    severity: warning
+    message: "Mas del 30% de CVs requieren fallback a niveles superiores"
+
+  - name: LowOpensourceConfidence
+    condition: avg(ocr_confidence_distribution{level="opensource"}) < 0.75
+    severity: warning
+    message: "Confianza promedio de PaddleOCR por debajo del umbral"
+
+  - name: HighLLMUsage
+    condition: rate(ocr_level_usage{level="llm_vision"}[1h]) > 10
+    severity: warning
+    message: "Alto uso de LLM Vision - revisar calidad de documentos entrantes"
+```
+
+### Ejemplo de Dashboard Grafana
+
+```
++----------------------------------+----------------------------------+
+|  Distribucion por Nivel (Pie)   |  Costo Acumulado (Line)         |
+|                                  |                                  |
+|   [75%] Open Source             |  $0.15 -----------------.        |
+|   [20%] Cloud Vision            |                        /         |
+|   [5%]  LLM Vision              |  $0.10 ---------------/          |
+|                                  |                      /           |
++----------------------------------+----------------------------------+
+|  Confianza Promedio (Gauge)     |  Latencia p95 (Bar)              |
+|                                  |                                  |
+|   OpenSource: [======85%]       |  OS:     [==] 1.2s              |
+|   Cloud:      [========95%]     |  Cloud:  [===] 1.8s             |
+|   LLM:        [=========98%]    |  LLM:    [=====] 3.5s           |
+|                                  |                                  |
++----------------------------------+----------------------------------+
+```
+
+---
+
 ## Riesgos y Mitigaciones
 
 | Riesgo | Probabilidad | Impacto | Mitigacion |
 |--------|--------------|---------|------------|
-| OCR falla en documentos de baja calidad | Media | Alto | Fallback a Google Vision, notificar usuario |
-| Extraccion incorrecta de datos | Media | Alto | Confidence score + revision manual |
-| Timeout en archivos grandes | Baja | Medio | Queue async, limites de tamano |
-| Costos de API escalan | Media | Medio | Caching agresivo, modelos locales |
-| Ataques de inyeccion via CV | Baja | Alto | Sanitizacion, sandbox de parsing |
+| OCR falla en documentos de baja calidad | Media | Alto | Pipeline 3 niveles con fallback automatico |
+| Extraccion incorrecta de datos | Media | Alto | Confidence score + revision manual + LLM fallback |
+| Timeout en archivos grandes | Baja | Medio | Queue async, limites de tamano (10 paginas max) |
+| Costos de API escalan | Baja | Medio | Nivel 1 gratuito procesa 70-80%, caching agresivo |
+| Ataques de inyeccion via CV | Baja | Alto | Sanitizacion, sandbox de parsing, validacion de formato |
+| PaddleOCR no disponible (GPU/memoria) | Baja | Medio | Fallback directo a Cloud Vision, mode CPU |
+| Google Cloud Vision rate limits | Baja | Medio | Queue con backoff exponencial, cache de resultados |
 
 ---
 
-## Plan de Implementacion
+## Plan de Implementacion (Actualizado v2.0)
 
-### Fase 1: MVP (Semanas 1-2)
+### Fase 1: MVP con OCR Hibrido (Semanas 1-2)
 - [ ] Setup de queue (BullMQ + Redis)
-- [ ] Parser basico (resume-parser)
-- [ ] OCR con Tesseract
-- [ ] Extraccion de campos basicos
+- [ ] Instalar PaddleOCR con modelos espanol
+- [ ] Instalar PP-DocLayout para deteccion de secciones
+- [ ] Implementar HybridCVParser clase base
+- [ ] Configurar Google Cloud Vision como Nivel 2
 - [ ] Almacenamiento en PostgreSQL
 
 ### Fase 2: NLP + Embeddings (Semanas 3-4)
-- [ ] Integracion spaCy con NER custom
-- [ ] Normalizacion de skills
-- [ ] Generacion de embeddings (OpenAI)
+- [ ] Integracion spaCy con NER custom (es_core_news_lg)
+- [ ] Normalizacion de skills con diccionario
+- [ ] Generacion de embeddings (OpenAI text-embedding-3-small)
 - [ ] Almacenamiento en pgvector
+- [ ] Implementar extraccion estructurada post-OCR
 
 ### Fase 3: Scoring + Sugerencias (Semana 5)
 - [ ] Algoritmo de ATS scoring
-- [ ] Generacion de sugerencias
+- [ ] Generacion de sugerencias contextuales
 - [ ] UI para visualizacion de resultados
+- [ ] Dashboard de metricas OCR
 
-### Fase 4: Optimizacion (Semana 6)
-- [ ] LLM fallback para casos edge
-- [ ] Mejora de accuracy
-- [ ] Performance tuning
-- [ ] Monitoreo y alertas
+### Fase 4: LLM Vision + Optimizacion (Semana 6)
+- [ ] Implementar Nivel 3 con GPT-4 Vision
+- [ ] Agregar soporte Gemini 1.5 Pro como alternativa
+- [ ] Metricas de fallback y alertas
+- [ ] Performance tuning (caching, pre-procesamiento condicional)
+- [ ] A/B testing de umbrales de confianza
+
+### Dependencias Tecnicas
+
+```bash
+# Python dependencies
+pip install paddleocr paddlex pdf2image python-docx
+pip install google-cloud-vision openai
+pip install spacy opencv-python numpy
+python -m spacy download es_core_news_lg
+
+# System dependencies (Ubuntu/Debian)
+apt-get install poppler-utils libreoffice
+```
 
 ---
 
 ## Referencias
 
-- [resume-parser npm](https://www.npmjs.com/package/resume-parser)
+- [PaddleOCR Documentation](https://github.com/PaddlePaddle/PaddleOCR)
+- [PaddleX PP-DocLayout](https://github.com/PaddlePaddle/PaddleX)
+- [Google Cloud Vision API](https://cloud.google.com/vision/docs)
+- [OpenAI Vision API](https://platform.openai.com/docs/guides/vision)
 - [spaCy NER](https://spacy.io/usage/linguistic-features#named-entities)
 - [OpenAI Embeddings](https://platform.openai.com/docs/guides/embeddings)
 - [BullMQ Documentation](https://docs.bullmq.io/)
-- [Tesseract.js](https://tesseract.projectnaptha.com/)
 - [pgvector](https://github.com/pgvector/pgvector)
+- [pdf2image](https://github.com/Belval/pdf2image)
 
 ---
 
@@ -614,3 +1100,4 @@ alerts:
 | Version | Fecha | Autor | Cambios |
 |---------|-------|-------|---------|
 | 1.0 | 2026-01-31 | Equipo de Arquitectura | Version inicial |
+| 2.0 | 2026-01-31 | Equipo de Arquitectura | Pipeline OCR hibrido 3 niveles: PaddleOCR + Cloud Vision + LLM Vision. Reemplazo de Tesseract por PaddleOCR. Agregado PP-DocLayout para deteccion de secciones. Metricas de fallback. Tabla de costos actualizada. |
